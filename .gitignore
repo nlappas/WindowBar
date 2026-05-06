@@ -1,0 +1,22 @@
+# macOS metadata
+.DS_Store
+
+# Xcode user data
+*.xcuserstate
+*.xcworkspace/xcuserdata/
+*.xcodeproj/xcuserdata/
+
+# Build products
+build/
+DerivedData/
+Products/
+*.app
+*.xctest
+*.ipa
+*.dSYM
+
+# Swift Package Manager
+.build/
+
+# Local archives / exported app bundles
+WindowBar/WindowBar 2026-04-23 20-43-00/
