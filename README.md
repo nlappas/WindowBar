@@ -2,6 +2,8 @@
 
 WindowBar is a macOS SwiftUI utility that shows a floating edge sidebar with the currently open apps and their windows. It is designed to make it faster to switch between windows, jump across Spaces, and send files to running apps.
 
+![WindowBar screenshot](screenshot.jpg)
+
 ## What It Does
 
 - Reveals a floating sidebar when you hover at the screen edge
