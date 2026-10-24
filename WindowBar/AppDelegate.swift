@@ -70,7 +70,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 }
 
 private final class SidebarWindowController: NSWindowController {
-    private let sidebarWidth: CGFloat = 508
+    // Wide enough for the rail plus the configured number of window list columns.
+    // The empty part of the panel is transparent, so clicks there pass through.
+    private func sidebarWidth(for screen: NSScreen) -> CGFloat {
+        let width = WindowGridSettings.baseSidebarWidth
+            + CGFloat(WindowGridSettings.storedMaxColumns - 1) * WindowGridSettings.columnStride
+        return min(width, screen.frame.width)
+    }
     private var sidebarOnRight: Bool {
         UserDefaults.standard.bool(forKey: "sidebarOnRight")
     }
@@ -99,6 +105,7 @@ private final class SidebarWindowController: NSWindowController {
         }
 
         let visibleFrame = screen.visibleFrame
+        let sidebarWidth = sidebarWidth(for: screen)
         let frame = CGRect(
             x: sidebarOnRight ? (screen.frame.maxX - sidebarWidth) : screen.frame.minX,
             y: visibleFrame.minY,

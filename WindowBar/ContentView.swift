@@ -11,6 +11,14 @@ import SwiftUI
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var inventory = WindowInventory()
+    @State private var previewStore = WindowPreviewStore()
+    @AppStorage("showWindowPreviews") private var showWindowPreviews = true
+    @AppStorage(WindowGridSettings.maxColumnsKey) private var maxPreviewColumns = WindowGridSettings.defaultMaxColumns
+    @AppStorage(WindowGridSettings.maxRowsKey) private var maxPreviewRows = WindowGridSettings.defaultMaxRows
+    @State private var windowPaneHeight: CGFloat = 470
+    /// Set by pressing Escape; cleared when the user hovers another app or the sidebar hides.
+    @State private var isWindowPaneDismissed = false
+    @State private var escapeKeyMonitors: [Any] = []
     @State private var sidebarSections: [SidebarSpaceSection] = []
     @State private var selectedEntryID: SidebarAppEntry.ID?
     @State private var hoveredEntryID: SidebarAppEntry.ID?
@@ -27,7 +35,6 @@ struct ContentView: View {
     @AppStorage("rememberRailScrollPosition") private var rememberRailScrollPosition = false
     @AppStorage("showCurrentSpaceOnly") private var showCurrentSpaceOnly = false
     @AppStorage("sidebarOnRight") private var sidebarOnRight = false
-    private let windowPaneHeight: CGFloat = 470
 
     private var railVisualLeftShift: CGFloat {
         CGFloat(railVisualLeftShiftStorage)
@@ -44,6 +51,39 @@ struct ContentView: View {
     private var activeEntry: SidebarAppEntry? {
         let activeID = hoveredEntryID ?? selectedEntryID ?? flatEntries.first?.id
         return flatEntries.first(where: { $0.id == activeID })
+    }
+
+    /// The "across" setting, limited to what fits in the sidebar panel.
+    private func effectiveMaxColumns(panelWidth: CGFloat) -> Int {
+        let setting = min(max(maxPreviewColumns, WindowGridSettings.columnRange.lowerBound), WindowGridSettings.columnRange.upperBound)
+        return min(setting, WindowGridSettings.columnsThatFit(screenWidth: panelWidth))
+    }
+
+    private var effectiveMaxRows: Int {
+        min(max(maxPreviewRows, WindowGridSettings.rowRange.lowerBound), WindowGridSettings.rowRange.upperBound)
+    }
+
+    /// How much wider than a single column the window list pane currently is.
+    private func activePaneExtraWidth(panelWidth: CGFloat) -> CGFloat {
+        guard let activeEntry, !isWindowPaneDismissed else {
+            return 0
+        }
+
+        let columns = WindowListPane.columnCount(
+            windowCount: activeEntry.windows.count,
+            maxColumns: effectiveMaxColumns(panelWidth: panelWidth)
+        )
+        return WindowListPane.width(columnCount: columns) - WindowListPane.baseWidth
+    }
+
+    /// Identifies which windows need previews right now. Changing it restarts the
+    /// capture task; nil means nothing should be captured.
+    private var previewRequestKey: String? {
+        guard showWindowPreviews, isSidebarRevealed, let activeEntry else {
+            return nil
+        }
+
+        return activeEntry.windows.map { String($0.id) }.joined(separator: ",")
     }
 
     var body: some View {
@@ -88,15 +128,27 @@ struct ContentView: View {
                             .offset(x: sidebarOnRight ? railVisualLeftShift : -railVisualLeftShift)
                             .zIndex(1)
 
-                            if let activeEntry {
+                            if let activeEntry, !isWindowPaneDismissed {
                                 WindowListPane(
                                     app: activeEntry.app,
                                     windowCountLabel: "\(activeEntry.windows.count) open windows",
                                     windows: activeEntry.windows,
+                                    previews: showWindowPreviews ? previewStore.previews : [:],
+                                    needsPreviewAccess: showWindowPreviews && !previewStore.hasScreenRecordingAccess,
+                                    onEnablePreviews: previewStore.requestAccess,
                                     onWindowSelect: { window in
                                         handleWindowSelection(window, in: activeEntry.app)
-                                    }
+                                    },
+                                    maxColumns: effectiveMaxColumns(panelWidth: proxy.size.width),
+                                    maxRows: effectiveMaxRows,
+                                    // Leave the same top and bottom insets the positioning uses.
+                                    maxHeight: max(0, proxy.size.height - 48)
                                 )
+                                .onGeometryChange(for: CGFloat.self) { geometry in
+                                    geometry.size.height
+                                } action: { height in
+                                    windowPaneHeight = height
+                                }
                                 .offset(
                                     x: sidebarOnRight ? (railVisualLeftShift - 100) : (100 - railVisualLeftShift),
                                     y: paneOffsetY(in: proxy.size.height)
@@ -107,10 +159,11 @@ struct ContentView: View {
                         }
                         // Keep the content as wide as the window list pane even when the
                         // pane is absent (e.g. a Space with no windows). Otherwise the
-                        // narrow rail alone gets centered in the 452pt frame and drifts
+                        // narrow rail alone gets centered in the frame and drifts
                         // away from the screen edge.
-                        .frame(minWidth: 340, alignment: sidebarOnRight ? .topTrailing : .topLeading)
-                        .frame(width: 452)
+                        .frame(minWidth: WindowListPane.baseWidth, alignment: sidebarOnRight ? .topTrailing : .topLeading)
+                        // Grow with the pane's extra columns so the hover region covers it.
+                        .frame(width: 452 + activePaneExtraWidth(panelWidth: proxy.size.width))
                         .frame(maxHeight: .infinity, alignment: sidebarOnRight ? .topTrailing : .topLeading)
                     }
 
@@ -133,6 +186,11 @@ struct ContentView: View {
         .background(HostingWindowReader { window in
             hostingWindow = window
         })
+        .onChange(of: hoveredEntryID) { _, _ in
+            isWindowPaneDismissed = false
+        }
+        .onAppear(perform: installEscapeKeyMonitors)
+        .onDisappear(perform: removeEscapeKeyMonitors)
         .task {
             inventory.startMonitoring()
             rebuildSidebarSections()
@@ -141,11 +199,20 @@ struct ContentView: View {
         .onChange(of: scenePhase) { _, newPhase in
             if newPhase == .active {
                 inventory.refreshAccessibilityStatus()
+                previewStore.refreshAccessStatus()
             }
         }
         .onChange(of: inventory.refreshToken) { _, _ in
             rebuildSidebarSections()
             normalizeSelection()
+            previewStore.prune(keeping: Set(apps.flatMap { $0.windows.map(\.id) }))
+        }
+        .task(id: previewRequestKey) {
+            guard previewRequestKey != nil, let activeEntry else {
+                return
+            }
+
+            await previewStore.loadPreviews(for: activeEntry.windows.map(\.id))
         }
         .animation(.easeOut(duration: 0.12), value: isSidebarRevealed)
         .animation(.easeOut(duration: 0.12), value: hoveredEntryID)
@@ -267,7 +334,53 @@ struct ContentView: View {
         }
     }
 
+    /// The sidebar panel never becomes key, so key presses go to the frontmost app.
+    /// A global monitor sees them anyway (it relies on Accessibility access); a local
+    /// monitor covers the case where one of WindowBar's own windows is key.
+    private func installEscapeKeyMonitors() {
+        guard escapeKeyMonitors.isEmpty else {
+            return
+        }
+
+        let escapeKeyCode: UInt16 = 53
+
+        if let globalMonitor = NSEvent.addGlobalMonitorForEvents(matching: .keyDown, handler: { event in
+            if event.keyCode == escapeKeyCode {
+                Task { @MainActor in
+                    handleEscapeKey()
+                }
+            }
+        }) {
+            escapeKeyMonitors.append(globalMonitor)
+        }
+
+        if let localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown, handler: { event in
+            guard event.keyCode == escapeKeyCode, isSidebarRevealed, !isWindowPaneDismissed else {
+                return event
+            }
+
+            handleEscapeKey()
+            return nil
+        }) {
+            escapeKeyMonitors.append(localMonitor)
+        }
+    }
+
+    private func removeEscapeKeyMonitors() {
+        escapeKeyMonitors.forEach(NSEvent.removeMonitor)
+        escapeKeyMonitors.removeAll()
+    }
+
+    private func handleEscapeKey() {
+        guard isSidebarRevealed else {
+            return
+        }
+
+        isWindowPaneDismissed = true
+    }
+
     private func hideSidebar() {
+        isWindowPaneDismissed = false
         hoverExitWatchTask?.cancel()
         hoverExitWatchTask = nil
         hoveredEntryID = nil
@@ -892,7 +1005,51 @@ private struct WindowListPane: View {
     let app: SidebarApp
     let windowCountLabel: String
     let windows: [SidebarWindow]
+    let previews: [CGWindowID: NSImage]
+    let needsPreviewAccess: Bool
+    let onEnablePreviews: () -> Void
     let onWindowSelect: (SidebarWindow) -> Void
+    /// Most columns to show side by side (the "across" setting, capped to the screen).
+    let maxColumns: Int
+    /// Most rows to show before the list scrolls (the "down" setting).
+    let maxRows: Int
+    /// Tallest the whole pane may be, so it never runs off the screen.
+    let maxHeight: CGFloat
+
+    @State private var measuredRowHeight: CGFloat = 0
+    @State private var headerHeight: CGFloat = 0
+
+    static let columnWidth: CGFloat = 308
+    static let columnSpacing: CGFloat = 10
+    private static let rowSpacing: CGFloat = 10
+    private static let listPadding: CGFloat = 16
+
+    /// Width of a single-column pane; extra columns extend it to the side.
+    static let baseWidth = columnWidth + listPadding * 2
+
+    /// Fills a row before starting the next one, so the pane grows sideways first.
+    static func columnCount(windowCount: Int, maxColumns: Int) -> Int {
+        min(max(windowCount, 1), max(maxColumns, 1))
+    }
+
+    static func width(columnCount: Int) -> CGFloat {
+        baseWidth + CGFloat(columnCount - 1) * (columnWidth + columnSpacing)
+    }
+
+    private var columnCount: Int {
+        Self.columnCount(windowCount: windows.count, maxColumns: maxColumns)
+    }
+
+    /// Height of the scrolling list: enough for `maxRows` rows (or fewer if there
+    /// aren't that many), limited by the space left under the header.
+    private var listHeight: CGFloat {
+        let rowCount = Int((Double(windows.count) / Double(columnCount)).rounded(.up))
+        let visibleRows = CGFloat(max(1, min(maxRows, rowCount)))
+        // Before the first row is measured, assume a row with a preview.
+        let rowHeight = measuredRowHeight > 0 ? measuredRowHeight : 254
+        let contentHeight = visibleRows * rowHeight + (visibleRows - 1) * Self.rowSpacing + Self.listPadding * 2
+        return max(0, min(contentHeight, maxHeight - headerHeight))
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -929,19 +1086,67 @@ private struct WindowListPane: View {
             Divider()
                 .overlay(.white.opacity(0.08))
 
+            VStack(alignment: .leading, spacing: 0) {
+                if needsPreviewAccess {
+                    Button(action: onEnablePreviews) {
+                        Label("Enable window previews", systemImage: "photo.on.rectangle")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(.white.opacity(0.8))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 8)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .background(
+                                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                                    .fill(.white.opacity(0.08))
+                            )
+                    }
+                    .buttonStyle(.plain)
+                    .help("Window previews need Screen Recording access")
+                    .padding([.horizontal, .top], Self.listPadding)
+                }
+            }
+
             ScrollView {
-                VStack(alignment: .leading, spacing: 10) {
+                LazyVGrid(
+                    columns: Array(
+                        repeating: GridItem(.fixed(Self.columnWidth), spacing: Self.columnSpacing, alignment: .top),
+                        count: columnCount
+                    ),
+                    alignment: .leading,
+                    spacing: Self.rowSpacing
+                ) {
                     ForEach(windows) { window in
-                        WindowRow(window: window) {
+                        WindowRow(window: window, preview: previews[window.id]) {
                             onWindowSelect(window)
+                        }
+                        // Track the tallest row so the list can show exactly `maxRows` rows.
+                        .onGeometryChange(for: CGFloat.self) { geometry in
+                            geometry.size.height
+                        } action: { height in
+                            if height > measuredRowHeight {
+                                measuredRowHeight = height
+                            }
                         }
                     }
                 }
-                .padding(16)
+                .padding(Self.listPadding)
             }
+            .frame(height: listHeight)
         }
-        .frame(width: 340)
-        .frame(maxHeight: 470)
+        .onGeometryChange(for: CGFloat.self) { geometry in
+            geometry.size.height
+        } action: { paneHeight in
+            // Everything above the scrolling list counts as header.
+            headerHeight = max(0, paneHeight - listHeight)
+        }
+        // Rows can shrink (e.g. previews turned off), so re-measure when they change.
+        .onChange(of: windows.map(\.id)) { _, _ in
+            measuredRowHeight = 0
+        }
+        .onChange(of: previews.isEmpty) { _, _ in
+            measuredRowHeight = 0
+        }
+        .frame(width: Self.width(columnCount: columnCount))
         .background(
             RoundedRectangle(cornerRadius: 30, style: .continuous)
                 .fill(Color(red: 0.11, green: 0.13, blue: 0.17).opacity(0.82))
@@ -957,11 +1162,23 @@ private struct WindowListPane: View {
 
 private struct WindowRow: View {
     let window: SidebarWindow
+    let preview: NSImage?
     let onSelect: () -> Void
 
     var body: some View {
         Button(action: onSelect) {
             VStack(alignment: .leading, spacing: 8) {
+                if let preview {
+                    Image(nsImage: preview)
+                        .resizable()
+                        .aspectRatio(contentMode: .fit)
+                        // Fixed height keeps rows the same size, so the grid can show
+                        // an exact number of rows.
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 150)
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+
                 HStack(alignment: .top) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text(window.title)

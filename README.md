@@ -51,6 +51,16 @@ open "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibil
 
 Each copy of the app needs its own entry, so add archived or exported builds separately. If the icon turns red again after a rebuild, remove WindowBar from the list with the **−** button and add it again.
 
+## Window Previews
+
+WindowBar can show a thumbnail of each window in the window list. Previews use ScreenCaptureKit and need Screen Recording permission, in addition to Accessibility.
+
+1. Hover an app in the sidebar and click **Enable window previews** in its window list.
+2. Approve the macOS prompt, or turn WindowBar on under `System Settings > Privacy & Security > Screen & System Audio Recording`.
+3. Quit and relaunch WindowBar if macOS asks you to.
+
+Previews are captured only for the app you are hovering and are refreshed at most every few seconds. Windows on other Spaces may show no preview, depending on the app. You can turn previews off in Settings.
+
 ## Project Structure
 
 ```text

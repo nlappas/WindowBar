@@ -324,6 +324,8 @@ final class WindowInventory {
         let spaceResolver = SpaceResolver()
         var cgWindowsByProcess: [pid_t: [CGWindowMetadata]] = [:]
         var appOrderByProcess: [pid_t: Int] = [:]
+        // Windows skipped as invisible helpers, so Accessibility can't re-add them.
+        var excludedWindowIDs = Set<CGWindowID>()
 
         for (index, info) in rawWindowInfo.enumerated() {
             guard
@@ -366,6 +368,16 @@ final class WindowInventory {
             // (e.g. Xcode keeps one around) rather than something the user can see or focus.
             // Including it would make the app appear to have a window on every Space.
             if !isOnScreen && rawSpaceIDs.count > 1 {
+                excludedWindowIDs.insert(windowID)
+                continue
+            }
+
+            // Every real window, even a hidden one, belongs to a Space. An off-screen
+            // window with no Space has been ordered out entirely: a closed panel the app
+            // keeps alive (e.g. Activity Monitor's CPU History) or a menu-bar strip.
+            // Listing it would show a phantom entry under "Space Unknown".
+            if !isOnScreen && rawSpaceIDs.isEmpty {
+                excludedWindowIDs.insert(windowID)
                 continue
             }
 
@@ -384,7 +396,14 @@ final class WindowInventory {
         }
 
         if accessibilityEnabled {
-            let axWindowsByProcess = accessibilityMetadata(for: runningApps)
+            let axWindowsByProcess = accessibilityMetadata(for: runningApps).mapValues { windows in
+                windows.filter { window in
+                    guard let windowID = window.windowID else {
+                        return true
+                    }
+                    return !excludedWindowIDs.contains(windowID)
+                }
+            }
             let apps = buildAppsFromAccessibility(
                 runningApps: runningApps,
                 appOrderByProcess: appOrderByProcess,
