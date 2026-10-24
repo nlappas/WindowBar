@@ -20,6 +20,9 @@ struct ContentView: View {
     @State private var dropTargetEntryID: SidebarAppEntry.ID?
     @State private var rememberedRailEntryID: SidebarAppEntry.ID?
     @State private var selectionTransitionTask: Task<Void, Never>?
+    @State private var hoverExitWatchTask: Task<Void, Never>?
+    @State private var hostingWindow: NSWindow?
+    @State private var sidebarRegionFrame: CGRect = .zero
     @AppStorage("railVisualLeftShift") private var railVisualLeftShiftStorage: Double = 30
     @AppStorage("rememberRailScrollPosition") private var rememberRailScrollPosition = false
     @AppStorage("showCurrentSpaceOnly") private var showCurrentSpaceOnly = false
@@ -75,6 +78,7 @@ struct ContentView: View {
                                 onOpenSettings: openSettings,
                                 onQuitApp: quitApp,
                                 showCurrentSpaceOnly: $showCurrentSpaceOnly,
+                                accessibilityEnabled: inventory.accessibilityEnabled,
                                 sidebarOnRight: sidebarOnRight,
                                 railVisualLeftShift: railVisualLeftShift,
                                 onRailShiftChange: updateRailVisualLeftShift(_:),
@@ -101,6 +105,11 @@ struct ContentView: View {
                                 .zIndex(0)
                             }
                         }
+                        // Keep the content as wide as the window list pane even when the
+                        // pane is absent (e.g. a Space with no windows). Otherwise the
+                        // narrow rail alone gets centered in the 452pt frame and drifts
+                        // away from the screen edge.
+                        .frame(minWidth: 340, alignment: sidebarOnRight ? .topTrailing : .topLeading)
                         .frame(width: 452)
                         .frame(maxHeight: .infinity, alignment: sidebarOnRight ? .topTrailing : .topLeading)
                     }
@@ -109,6 +118,11 @@ struct ContentView: View {
                         sidebarEdgeActivator
                     }
                 }
+                .onGeometryChange(for: CGRect.self) { geometry in
+                    geometry.frame(in: .global)
+                } action: { frame in
+                    sidebarRegionFrame = frame
+                }
                 .onHover(perform: handleSidebarRegionHover)
             }
             .padding(.vertical, 24)
@@ -116,6 +130,9 @@ struct ContentView: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: sidebarOnRight ? .trailing : .leading)
         .background(Color.clear)
+        .background(HostingWindowReader { window in
+            hostingWindow = window
+        })
         .task {
             inventory.startMonitoring()
             rebuildSidebarSections()
@@ -172,17 +189,64 @@ struct ContentView: View {
     }
 
     private func handleSidebarRegionHover(_ isHovering: Bool) {
-        isHoveringSidebarRegion = isHovering
-
         if isHovering {
+            hoverExitWatchTask?.cancel()
+            hoverExitWatchTask = nil
+            isHoveringSidebarRegion = true
             return
         }
+
+        // Switching Spaces makes the system report a hover exit even though the pointer
+        // never moved. Ignore exits while the pointer is still over the sidebar so it
+        // stays up through the transition, and hide it once the pointer really leaves.
+        if isSidebarRevealed && isPointerInsideSidebarRegion() {
+            watchForRealHoverExit()
+            return
+        }
+
+        isHoveringSidebarRegion = false
 
         if isSelectionTransitionInFlight {
             return
         }
 
         hideSidebar()
+    }
+
+    /// After an ignored hover exit SwiftUI may not report another exit, so poll the
+    /// pointer until it leaves the sidebar or a real hover event takes over.
+    private func watchForRealHoverExit() {
+        hoverExitWatchTask?.cancel()
+        hoverExitWatchTask = Task { @MainActor in
+            while !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(100))
+                guard !Task.isCancelled, isSidebarRevealed else {
+                    return
+                }
+
+                if !isPointerInsideSidebarRegion() {
+                    hoverExitWatchTask = nil
+                    handleSidebarRegionHover(false)
+                    return
+                }
+            }
+        }
+    }
+
+    private func isPointerInsideSidebarRegion() -> Bool {
+        guard
+            let hostingWindow,
+            let contentHeight = hostingWindow.contentView?.bounds.height,
+            !sidebarRegionFrame.isEmpty
+        else {
+            return false
+        }
+
+        // Screen coordinates have a bottom-left origin; SwiftUI's global space is
+        // top-left relative to the window content, so flip the y axis.
+        let windowPoint = hostingWindow.convertPoint(fromScreen: NSEvent.mouseLocation)
+        let swiftUIPoint = CGPoint(x: windowPoint.x, y: contentHeight - windowPoint.y)
+        return sidebarRegionFrame.contains(swiftUIPoint)
     }
 
     private func beginSelectionTransition() {
@@ -204,6 +268,8 @@ struct ContentView: View {
     }
 
     private func hideSidebar() {
+        hoverExitWatchTask?.cancel()
+        hoverExitWatchTask = nil
         hoveredEntryID = nil
         dropTargetEntryID = nil
         isSidebarRevealed = false
@@ -320,7 +386,8 @@ struct ContentView: View {
                 spaceLabel: labelsBySpaceKey[spaceKey] ?? "Space Unknown",
                 spaceKey: spaceKey,
                 sortOrder: orderByAppAndSpace[compoundKey] ?? .max,
-                windows: windows.sorted(by: sidebarWindowSort(lhs:rhs:))
+                windows: windows.sorted(by: sidebarWindowSort(lhs:rhs:)),
+                isHidden: windows.allSatisfy { isWindowHidden($0, in: currentSpaceIDs) }
             )
         }
 
@@ -332,8 +399,14 @@ struct ContentView: View {
                 return lhsKey < rhsKey
             }
             .map { key in
+                // Visible entries first, hidden ones after; app order within each group.
                 let entries = (entries.filter { $0.spaceKey == key })
-                    .sorted { lhs, rhs in lhs.sortOrder < rhs.sortOrder }
+                    .sorted { lhs, rhs in
+                        if lhs.isHidden != rhs.isHidden {
+                            return !lhs.isHidden
+                        }
+                        return lhs.sortOrder < rhs.sortOrder
+                    }
                 return SidebarSpaceSection(
                     spaceKey: key,
                     label: labelsBySpaceKey[key] ?? "Space Unknown",
@@ -345,6 +418,17 @@ struct ContentView: View {
     private func isWindowVisible(_ window: SidebarWindow, in currentSpaceIDs: Set<UInt64>) -> Bool {
         guard showCurrentSpaceOnly, !currentSpaceIDs.isEmpty else {
             return true
+        }
+
+        return !Set(window.rawSpaceIDs).isDisjoint(with: currentSpaceIDs)
+    }
+
+    /// A window that belongs to the current Space but isn't drawn on screen is minimized,
+    /// or closed while its app keeps it alive. Windows on other Spaces are never on screen,
+    /// so they can't be judged this way and count as visible.
+    private func isWindowHidden(_ window: SidebarWindow, in currentSpaceIDs: Set<UInt64>) -> Bool {
+        guard !window.isOnScreen else {
+            return false
         }
 
         return !Set(window.rawSpaceIDs).isDisjoint(with: currentSpaceIDs)
@@ -403,6 +487,7 @@ private struct SidebarRail: View {
     let onOpenSettings: () -> Void
     let onQuitApp: () -> Void
     @Binding var showCurrentSpaceOnly: Bool
+    let accessibilityEnabled: Bool
     let sidebarOnRight: Bool
     let railVisualLeftShift: CGFloat
     let onRailShiftChange: (CGFloat) -> Void
@@ -443,6 +528,7 @@ private struct SidebarRail: View {
                                         badgeCount: entry.windows.count,
                                             isSelected: selectedEntryID == entry.id || hoveredEntryID == entry.id,
                                             isDropTarget: dropTargetEntryID == entry.id,
+                                            isHidden: entry.isHidden,
                                             onSelect: {
                                                 onSelect(entry)
                                             },
@@ -503,10 +589,16 @@ private struct SidebarRail: View {
                 Spacer(minLength: 0)
 
                 VStack(spacing: 10) {
-                    utilityTooltipArea("Show only windows from the current Space") {
+                    utilityTooltipArea(
+                        accessibilityEnabled
+                            ? "Show only windows from the current Space"
+                            : "Accessibility access is missing, so the window list may include hidden helper windows"
+                    ) {
                         compactRailToggle(
                             systemName: "square.stack.3d.up.fill",
                             helpText: "Show only current Space",
+                            // Red signals that Accessibility permission is missing.
+                            iconColor: accessibilityEnabled ? .white.opacity(0.8) : .red,
                             isOn: $showCurrentSpaceOnly
                         )
                     }
@@ -596,12 +688,13 @@ private struct SidebarRail: View {
     private func compactRailToggle(
         systemName: String,
         helpText: String,
+        iconColor: Color,
         isOn: Binding<Bool>
     ) -> some View {
         HStack(spacing: 8) {
             Image(systemName: systemName)
                 .font(.system(size: 11, weight: .bold))
-                .foregroundStyle(.white.opacity(0.8))
+                .foregroundStyle(iconColor)
                 .frame(width: 14)
 
             Toggle("", isOn: isOn)
@@ -725,6 +818,7 @@ private struct SidebarAppIcon: View {
     let badgeCount: Int
     let isSelected: Bool
     let isDropTarget: Bool
+    let isHidden: Bool
     let onSelect: () -> Void
     let onHover: (Bool) -> Void
     let onHide: () -> Void
@@ -740,6 +834,8 @@ private struct SidebarAppIcon: View {
                         .resizable()
                         .scaledToFit()
                         .frame(width: 28, height: 28)
+                        // Dim apps whose windows are all minimized or closed.
+                        .opacity(isHidden ? 0.4 : 1)
                 } else {
                     Image(systemName: "app.fill")
                         .font(.system(size: 18, weight: .bold))
@@ -749,6 +845,7 @@ private struct SidebarAppIcon: View {
                             RoundedRectangle(cornerRadius: 10, style: .continuous)
                                 .fill(.white.opacity(0.08))
                         )
+                        .opacity(isHidden ? 0.4 : 1)
                 }
 
                 if badgeCount > 1 {
@@ -931,12 +1028,40 @@ private struct SidebarSpaceSection: Identifiable {
     var id: String { spaceKey }
 }
 
+/// Reports the AppKit window hosting the SwiftUI view, so the view can convert
+/// screen coordinates (such as the pointer location) into its own space.
+private struct HostingWindowReader: NSViewRepresentable {
+    let onResolve: (NSWindow?) -> Void
+
+    func makeNSView(context: Context) -> WindowResolvingView {
+        let view = WindowResolvingView()
+        view.onResolve = onResolve
+        return view
+    }
+
+    func updateNSView(_ nsView: WindowResolvingView, context: Context) {
+        nsView.onResolve = onResolve
+    }
+
+    final class WindowResolvingView: NSView {
+        var onResolve: ((NSWindow?) -> Void)?
+
+        override func viewDidMoveToWindow() {
+            super.viewDidMoveToWindow()
+            onResolve?(window)
+        }
+    }
+}
+
 private struct SidebarAppEntry: Identifiable {
     let app: SidebarApp
     let spaceLabel: String
     let spaceKey: String
     let sortOrder: Int
     let windows: [SidebarWindow]
+    /// True when none of the entry's windows are actually drawn on screen,
+    /// e.g. they are minimized or closed but kept alive by the app.
+    let isHidden: Bool
 
     var id: String { "\(app.id)-\(spaceKey)" }
 }

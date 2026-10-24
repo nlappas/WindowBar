@@ -25,6 +25,7 @@ final class WindowInventory {
     var refreshToken = 0
 
     private var refreshTask: Task<Void, Never>?
+    private var spaceChangeTask: Task<Void, Never>?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var isMonitoring = false
     private var cachedWindowTitles: [CGWindowID: String] = [:]
@@ -39,6 +40,20 @@ final class WindowInventory {
         accessibilityEnabled = isAccessibilityTrusted(prompt: false)
         installWorkspaceObservers()
         refresh()
+
+        // Refresh as soon as the user switches Spaces instead of waiting for the next
+        // periodic refresh, so the "current Space only" list updates immediately.
+        // Space-change messages are only posted on NSWorkspace's own notification center.
+        spaceChangeTask = Task { [weak self] in
+            let workspace = NSWorkspace.shared
+            let spaceChanges = workspace.notificationCenter.messages(of: workspace, for: .activeSpaceDidChange)
+            for await _ in spaceChanges {
+                guard let self, !Task.isCancelled else {
+                    return
+                }
+                self.refresh()
+            }
+        }
 
         refreshTask = Task { [weak self] in
             while let self, !Task.isCancelled {
@@ -97,6 +112,19 @@ final class WindowInventory {
         runningApplication.activate()
     }
 
+    /// Relaunching an already-running app sends it a "reopen" event, the same one a Dock
+    /// click sends, so apps with no open windows bring their main window back.
+    private func reopenApp(_ app: SidebarApp) {
+        guard let applicationURL = app.applicationURL else {
+            activateApp(app)
+            return
+        }
+
+        let configuration = NSWorkspace.OpenConfiguration()
+        configuration.activates = true
+        NSWorkspace.shared.openApplication(at: applicationURL, configuration: configuration) { _, _ in }
+    }
+
     func hideApp(_ app: SidebarApp) {
         NSRunningApplication(processIdentifier: app.processIdentifier)?.hide()
         refresh()
@@ -145,6 +173,10 @@ final class WindowInventory {
                 ?? matchingWindowElement(for: window, processIdentifier: app.processIdentifier)
 
             guard let matchedWindow else {
+                // Accessibility doesn't list windows an app has closed but kept alive
+                // (Notes and Activity Monitor do this). Reopen the app like a Dock click,
+                // which makes it show its main window again.
+                self.reopenApp(app)
                 return
             }
 
@@ -327,6 +359,15 @@ final class WindowInventory {
             let isOnScreen = (info[kCGWindowIsOnscreen as String] as? NSNumber)?.boolValue ?? false
             let workspaceID = (info[Self.windowWorkspaceDictionaryKey] as? NSNumber)?.intValue
             let title = info[kCGWindowName as String] as? String
+            let rawSpaceIDs = spaceResolver.rawSpaceIDs(for: windowID)
+
+            // A window assigned to several Spaces is "sticky" (joins all Spaces). If it is
+            // also off-screen it has been ordered out, so it is an invisible helper window
+            // (e.g. Xcode keeps one around) rather than something the user can see or focus.
+            // Including it would make the app appear to have a window on every Space.
+            if !isOnScreen && rawSpaceIDs.count > 1 {
+                continue
+            }
 
             let metadata = CGWindowMetadata(
                 windowID: windowID,
@@ -335,7 +376,7 @@ final class WindowInventory {
                 isOnScreen: isOnScreen,
                 fallbackWorkspaceID: workspaceID,
                 spaceLabels: spaceResolver.spaceLabels(for: windowID, fallbackWorkspaceID: workspaceID),
-                rawSpaceIDs: spaceResolver.rawSpaceIDs(for: windowID)
+                rawSpaceIDs: rawSpaceIDs
             )
 
             cgWindowsByProcess[processID, default: []].append(metadata)
