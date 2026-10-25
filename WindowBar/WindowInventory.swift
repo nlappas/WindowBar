@@ -33,6 +33,12 @@ final class WindowInventory {
     private var isMonitoring = false
     private var cachedWindowTitles: [CGWindowID: String] = [:]
     private var cachedWindowTitlesBySignature: [WindowTitleSignature: String] = [:]
+    private var windowUseTask: Task<Void, Never>?
+    /// How recently each window was in front, as an increasing stamp. Only windows on a
+    /// showing Space get restamped, so windows on other Spaces keep the order they had
+    /// when the user last worked there. Not observed: it changes constantly.
+    @ObservationIgnored private var windowUseStamps: [CGWindowID: UInt64] = [:]
+    @ObservationIgnored private var nextWindowUseStamp: UInt64 = 0
 
     func startMonitoring() {
         guard !isMonitoring else {
@@ -64,13 +70,57 @@ final class WindowInventory {
                 self.refresh()
             }
         }
+
+        // Track window use more often than the full refresh, so a window the user
+        // touched just before switching Spaces is still recorded as the latest.
+        windowUseTask = Task { [weak self] in
+            while let self, !Task.isCancelled {
+                try? await Task.sleep(for: .milliseconds(500))
+                self.recordWindowUse()
+            }
+        }
     }
 
     func refresh() {
         refreshAccessibilityStatus()
         apps = loadApps()
+        recordWindowUse()
+        pruneWindowUseStamps()
         lastRefreshDate = Date()
         refreshToken += 1
+    }
+
+    /// The window among `windows` that was most recently in front, or nil if none of
+    /// them has been seen on screen yet.
+    func mostRecentlyUsedWindow(in windows: [SidebarWindow]) -> SidebarWindow? {
+        windows
+            .filter { windowUseStamps[$0.id] != nil }
+            .max { (windowUseStamps[$0.id] ?? 0) < (windowUseStamps[$1.id] ?? 0) }
+    }
+
+    /// Stamps every on-screen window in stacking order, frontmost newest. Within one app
+    /// on one Space, the stacking order is the order the user last used its windows.
+    private func recordWindowUse() {
+        guard let windowInfo = CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]] else {
+            return
+        }
+
+        let frontToBackWindowIDs = windowInfo.compactMap { info -> CGWindowID? in
+            guard info[kCGWindowLayer as String] as? Int == 0 else {
+                return nil
+            }
+            return (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value
+        }
+
+        for windowID in frontToBackWindowIDs.reversed() {
+            nextWindowUseStamp += 1
+            windowUseStamps[windowID] = nextWindowUseStamp
+        }
+    }
+
+    private func pruneWindowUseStamps() {
+        let knownWindowIDs = Set(apps.flatMap { $0.windows.map(\.id) })
+        windowUseStamps = windowUseStamps.filter { knownWindowIDs.contains($0.key) }
     }
 
     func requestAccessibilityAccess() {
@@ -399,7 +449,15 @@ final class WindowInventory {
         }
 
         let currentProcessID = ProcessInfo.processInfo.processIdentifier
-        let runningApps = Dictionary(uniqueKeysWithValues: NSWorkspace.shared.runningApplications.map { ($0.processIdentifier, $0) })
+        // The list can hold the same process ID more than once: apps that are quitting
+        // report -1, which happens to many at once around sleep and display changes.
+        // Skip those and keep the first entry for any other duplicate.
+        let runningApps = Dictionary(
+            NSWorkspace.shared.runningApplications
+                .filter { $0.processIdentifier > 0 && !$0.isTerminated }
+                .map { ($0.processIdentifier, $0) },
+            uniquingKeysWith: { first, _ in first }
+        )
         let spaceResolver = SpaceResolver()
         var cgWindowsByProcess: [pid_t: [CGWindowMetadata]] = [:]
         var appOrderByProcess: [pid_t: Int] = [:]

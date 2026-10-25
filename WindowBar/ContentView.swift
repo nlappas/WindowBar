@@ -242,7 +242,8 @@ struct ContentView: View {
         selectedEntryID = entry.id
         beginSelectionTransition()
 
-        if let topWindow = entry.windows.first {
+        // Bring back the window the user last worked in, like the Dock does.
+        if let topWindow = inventory.mostRecentlyUsedWindow(in: entry.windows) ?? entry.windows.first {
             inventory.focusWindow(topWindow, in: entry.app)
         } else {
             inventory.activateApp(entry.app)
@@ -469,7 +470,7 @@ struct ContentView: View {
 
     private func buildSidebarSections() -> [SidebarSpaceSection] {
         let currentSpaceIDs = Set(inventory.currentSpaceIDs())
-        let appOrder = Dictionary(uniqueKeysWithValues: apps.enumerated().map { ($1.id, $0) })
+        let appOrder = Dictionary(apps.enumerated().map { ($1.id, $0) }, uniquingKeysWith: { first, _ in first })
         var windowsByAppAndSpace: [String: [SidebarWindow]] = [:]
         var appByAppAndSpace: [String: SidebarApp] = [:]
         var orderByAppAndSpace: [String: Int] = [:]
