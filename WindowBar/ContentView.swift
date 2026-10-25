@@ -10,8 +10,15 @@ import SwiftUI
 
 struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
-    @State private var inventory = WindowInventory()
-    @State private var previewStore = WindowPreviewStore()
+    @State private var inventory: WindowInventory
+    @State private var previewStore: WindowPreviewStore
+
+    /// The app delegate passes shared instances so the window switcher sees the same
+    /// windows and cached previews; previews get their own.
+    init(inventory: WindowInventory? = nil, previewStore: WindowPreviewStore? = nil) {
+        _inventory = State(initialValue: inventory ?? WindowInventory())
+        _previewStore = State(initialValue: previewStore ?? WindowPreviewStore())
+    }
     @AppStorage("showWindowPreviews") private var showWindowPreviews = true
     @AppStorage(WindowGridSettings.maxColumnsKey) private var maxPreviewColumns = WindowGridSettings.defaultMaxColumns
     @AppStorage(WindowGridSettings.maxRowsKey) private var maxPreviewRows = WindowGridSettings.defaultMaxRows

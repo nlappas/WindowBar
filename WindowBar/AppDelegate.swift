@@ -14,6 +14,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private var sidebarWindowController: SidebarWindowController?
     private var settingsWindowController: SettingsWindowController?
+    private var windowSwitcherController: WindowSwitcherController?
+    private let inventory = WindowInventory()
+    private let previewStore = WindowPreviewStore()
     private var defaultsObserver: NSObjectProtocol?
 
     override init() {
@@ -28,9 +31,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ] as CFDictionary)
 
         NSApp.setActivationPolicy(.accessory)
-        let controller = SidebarWindowController()
+        let controller = SidebarWindowController(inventory: inventory, previewStore: previewStore)
         controller.showWindow(self)
         sidebarWindowController = controller
+
+        let switcher = WindowSwitcherController(inventory: inventory, previewStore: previewStore)
+        switcher.start()
+        windowSwitcherController = switcher
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleScreenParametersChange),
@@ -81,12 +88,12 @@ private final class SidebarWindowController: NSWindowController {
         UserDefaults.standard.bool(forKey: "sidebarOnRight")
     }
 
-    convenience init() {
+    convenience init(inventory: WindowInventory, previewStore: WindowPreviewStore) {
         let panel = SidebarPanel()
         self.init(window: panel)
 
         let containerView = NSView(frame: .zero)
-        let hostingView = NSHostingView(rootView: ContentView())
+        let hostingView = NSHostingView(rootView: ContentView(inventory: inventory, previewStore: previewStore))
         hostingView.translatesAutoresizingMaskIntoConstraints = false
         containerView.addSubview(hostingView)
         NSLayoutConstraint.activate([

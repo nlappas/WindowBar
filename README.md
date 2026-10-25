@@ -12,6 +12,7 @@ WindowBar is a macOS SwiftUI utility that shows a floating edge sidebar with the
 - Focuses a selected window and switches to its Space when needed
 - Lets you hide or quit apps directly from the sidebar
 - Supports dropping files onto app icons to open them in that app
+- Shows previews of the front app's windows while you cycle them with Command-` (needs window previews enabled)
 - Includes settings for:
   - showing only the current Space
   - placing the sidebar on the right edge

@@ -85,6 +85,37 @@ final class WindowInventory {
         SpaceResolver().currentSpaceIDs()
     }
 
+    /// Whether the window is on a Space showing on any display right now.
+    func isOnVisibleSpace(_ window: SidebarWindow) -> Bool {
+        !Set(window.rawSpaceIDs).isDisjoint(with: currentSpaceIDs())
+    }
+
+    /// The window number of the app's focused window, read through Accessibility.
+    func focusedWindowID(processIdentifier: pid_t) -> CGWindowID? {
+        guard accessibilityEnabled else {
+            return nil
+        }
+
+        let applicationElement = AXUIElementCreateApplication(processIdentifier)
+        guard let focusedWindow = axElementValue(for: kAXFocusedWindowAttribute, on: applicationElement) else {
+            return nil
+        }
+
+        return axWindowID(of: focusedWindow)
+    }
+
+    /// The Core Graphics window number behind an Accessibility window element.
+    /// Uses the private `_AXUIElementGetWindow` call, which works for all apps; the
+    /// public-looking "AXWindowNumber" attribute isn't provided on this system.
+    private func axWindowID(of element: AXUIElement) -> CGWindowID? {
+        var windowID: CGWindowID = 0
+        if AXUIElementGetWindowSPI(element, &windowID) == .success, windowID != 0 {
+            return windowID
+        }
+
+        return axIntValue(for: "AXWindowNumber", on: element).map(CGWindowID.init)
+    }
+
     func openAccessibilitySettings() {
         guard let settingsURL = Self.accessibilitySettingsURL else {
             return
@@ -249,7 +280,7 @@ final class WindowInventory {
         }
 
         return windowElements.first { element in
-            axIntValue(for: "AXWindowNumber", on: element) == Int(windowID)
+            axWindowID(of: element) == windowID
         }
     }
 
@@ -966,10 +997,10 @@ final class WindowInventory {
     private func focusMatchScore(for window: SidebarWindow, element: AXUIElement) -> Int {
         var score = 0
 
-        if let axWindowNumber = axIntValue(for: "AXWindowNumber", on: element) {
+        if let axWindowNumber = axWindowID(of: element) {
             // A known, different window number means a different window, however
             // similar its title or size (e.g. the same app's window on another display).
-            guard CGWindowID(axWindowNumber) == window.id else {
+            guard axWindowNumber == window.id else {
                 return 0
             }
             score += 10
@@ -1523,6 +1554,9 @@ private func CGSCopyManagedDisplaySpaces(_ connection: CGSConnectionID) -> CFArr
 
 @_silgen_name("CGSCopySpacesForWindows")
 private func CGSCopySpacesForWindows(_ connection: CGSConnectionID, _ selector: Int32, _ windowIDs: CFArray) -> CFArray?
+
+@_silgen_name("_AXUIElementGetWindow")
+private func AXUIElementGetWindowSPI(_ element: AXUIElement, _ windowID: UnsafeMutablePointer<CGWindowID>) -> AXError
 
 @_silgen_name("GetProcessForPID")
 private func LegacyGetProcessForPID(_ processIdentifier: pid_t, _ processSerialNumber: UnsafeMutablePointer<ProcessSerialNumber>) -> OSStatus
