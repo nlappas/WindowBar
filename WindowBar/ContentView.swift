@@ -528,6 +528,9 @@ struct ContentView: View {
             }
     }
 
+    /// With "Show only current Space" on, keeps windows on any Space that is showing
+    /// right now. `currentSpaceIDs` holds the visible Space of every display, so with
+    /// two monitors the windows of both visible Spaces are listed.
     private func isWindowVisible(_ window: SidebarWindow, in currentSpaceIDs: Set<UInt64>) -> Bool {
         guard showCurrentSpaceOnly, !currentSpaceIDs.isEmpty else {
             return true

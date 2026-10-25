@@ -28,6 +28,7 @@ final class WindowInventory {
     private var refreshTask: Task<Void, Never>?
     private var spaceChangeTask: Task<Void, Never>?
     private var focusTask: Task<Void, Never>?
+    private var loggedUnknownSpaceWindowIDs = Set<CGWindowID>()
     private var workspaceObservers: [NSObjectProtocol] = []
     private var isMonitoring = false
     private var cachedWindowTitles: [CGWindowID: String] = [:]
@@ -460,15 +461,55 @@ final class WindowInventory {
             )
 
             if !apps.isEmpty {
-                return apps
+                return removingWindowsOnUnknownSpaces(apps, spaceResolver: spaceResolver)
             }
         }
 
-        return buildAppsFromCGWindows(
+        let apps = buildAppsFromCGWindows(
             runningApps: runningApps,
             appOrderByProcess: appOrderByProcess,
             cgWindowsByProcess: cgWindowsByProcess
         )
+        return removingWindowsOnUnknownSpaces(apps, spaceResolver: spaceResolver)
+    }
+
+    /// Drops windows that aren't on any Space Mission Control knows about, and apps
+    /// left with no windows. Such windows can't be placed in a Space section or
+    /// switched to, so they'd only appear as "Space Unknown" entries.
+    private func removingWindowsOnUnknownSpaces(_ apps: [SidebarApp], spaceResolver: SpaceResolver) -> [SidebarApp] {
+        apps.compactMap { app in
+            let knownWindows = app.windows.filter { window in
+                let isKnown = window.rawSpaceIDs.contains(where: spaceResolver.isKnownSpace)
+                if !isKnown {
+                    logWindowOnUnknownSpace(window, appName: app.name)
+                }
+                return isKnown
+            }
+
+            guard !knownWindows.isEmpty else {
+                return nil
+            }
+
+            return SidebarApp(
+                processIdentifier: app.processIdentifier,
+                name: app.name,
+                bundleIdentifier: app.bundleIdentifier,
+                applicationURL: app.applicationURL,
+                icon: app.icon,
+                windows: knownWindows
+            )
+        }
+    }
+
+    /// Debug builds log each skipped window once, rather than on every refresh.
+    private func logWindowOnUnknownSpace(_ window: SidebarWindow, appName: String) {
+        #if DEBUG
+        guard loggedUnknownSpaceWindowIDs.insert(window.id).inserted else {
+            return
+        }
+
+        inventoryLogger.debug("Skipping \(appName, privacy: .public) window \(window.id) \"\(window.title, privacy: .public)\": unknown Space \(window.rawSpaceIDs, privacy: .public), on screen: \(window.isOnScreen), frame \(String(describing: window.frame), privacy: .public)")
+        #endif
     }
 
     private func buildAppsFromAccessibility(
@@ -509,7 +550,11 @@ final class WindowInventory {
                             ownerName: app.localizedName ?? "Unknown App",
                             frame: axWindow.frame,
                             spaceLabels: matchedCGWindow?.spaceLabels ?? fallbackSpaceLabels,
-                            rawSpaceIDs: matchedCGWindow?.rawSpaceIDs ?? [],
+                            // Without a Core Graphics match, look the Space up by the
+                            // window number Accessibility reported.
+                            rawSpaceIDs: matchedCGWindow?.rawSpaceIDs
+                                ?? axWindow.windowID.map { spaceResolver.rawSpaceIDs(for: $0) }
+                                ?? [],
                             isOnScreen: matchedCGWindow?.isOnScreen ?? true,
                             isMinimized: false,
                             isVisibleOnCurrentDisplay: matchedCGWindow?.isVisibleOnCurrentDisplay ?? axWindow.isVisibleOnCurrentDisplay
@@ -1397,6 +1442,8 @@ private struct WindowTitleSignature: Hashable {
 /// Logs window-focus and Space-switch decisions. View them with:
 /// `log show --last 5m --info --predicate 'subsystem == "lapp.WindowBar"'`
 private let focusLogger = Logger(subsystem: "lapp.WindowBar", category: "focus")
+/// Logs windows left out of the inventory. Debug messages need `--debug` with `log show`.
+private let inventoryLogger = Logger(subsystem: "lapp.WindowBar", category: "inventory")
 
 /// A Mission Control keyboard shortcut as configured in System Settings > Keyboard >
 /// Keyboard Shortcuts > Mission Control, read from the system's symbolic hot keys.
@@ -1564,6 +1611,11 @@ private struct SpaceResolver {
         }
 
         return []
+    }
+
+    /// Whether the Space is one of the Mission Control Spaces on a connected display.
+    func isKnownSpace(_ spaceID: UInt64) -> Bool {
+        labelsBySpaceID[spaceID] != nil
     }
 
     func rawSpaceIDs(for windowID: CGWindowID) -> [UInt64] {
