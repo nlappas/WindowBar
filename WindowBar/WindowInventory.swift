@@ -12,6 +12,7 @@ import Darwin
 import Foundation
 import Observation
 import CoreFoundation
+import OSLog
 
 @MainActor
 @Observable
@@ -26,6 +27,7 @@ final class WindowInventory {
 
     private var refreshTask: Task<Void, Never>?
     private var spaceChangeTask: Task<Void, Never>?
+    private var focusTask: Task<Void, Never>?
     private var workspaceObservers: [NSObjectProtocol] = []
     private var isMonitoring = false
     private var cachedWindowTitles: [CGWindowID: String] = [:]
@@ -156,27 +158,65 @@ final class WindowInventory {
             return
         }
 
-        Task { @MainActor in
+        // A new click replaces any focus still in progress, so overlapping attempts
+        // can't send extra Space switches and overshoot.
+        focusTask?.cancel()
+        focusTask = Task { @MainActor in
             let spaceResolver = SpaceResolver()
-            if let targetSpaceID = window.rawSpaceIDs.first,
-               !spaceResolver.currentSpaceIDs().contains(targetSpaceID) {
-                _ = spaceResolver.switchToSpace(targetSpaceID)
-                for _ in 0..<6 {
-                    try? await Task.sleep(for: .milliseconds(50))
-                    if spaceResolver.currentSpaceIDs().contains(targetSpaceID) {
+            let currentSpaceIDs = Set(spaceResolver.currentSpaceIDs())
+            // Decide this before switching: afterwards the target Space is current.
+            let isOnAnotherSpace = !window.rawSpaceIDs.isEmpty
+                && Set(window.rawSpaceIDs).isDisjoint(with: currentSpaceIDs)
+
+            focusLogger.info("focusWindow: \(app.name, privacy: .public) window \(window.id) on spaces \(window.rawSpaceIDs, privacy: .public), current spaces \(currentSpaceIDs.sorted(), privacy: .public), on another Space: \(isOnAnotherSpace)")
+
+            if isOnAnotherSpace, let targetSpaceID = window.rawSpaceIDs.first {
+                // The switch animates, and Accessibility may only list the target
+                // window once its Space is showing, so wait for the switch to land.
+                // Retry the swipe once if the first one didn't take.
+                var didSwitch = false
+                for attempt in 1...2 where !didSwitch {
+                    let started = spaceResolver.switchToSpace(targetSpaceID)
+                    // Each step animates, so allow up to two seconds.
+                    for _ in 0..<40 {
+                        try? await Task.sleep(for: .milliseconds(50))
+                        guard !Task.isCancelled else {
+                            return
+                        }
+                        if spaceResolver.currentSpaceIDs().contains(targetSpaceID) {
+                            didSwitch = true
+                            break
+                        }
+                    }
+                    let spacesNow = Set(spaceResolver.currentSpaceIDs())
+                    focusLogger.info("focusWindow: switch attempt \(attempt) started: \(started), reached target: \(didSwitch), current spaces now \(spacesNow.sorted(), privacy: .public)")
+
+                    // Only retry if nothing moved; a partial move means the switch is
+                    // working and retrying would overshoot.
+                    if spacesNow != currentSpaceIDs {
                         break
                     }
                 }
             }
 
-            let matchedWindow = exactWindowElement(windowID: window.id, processIdentifier: app.processIdentifier)
+            let exactWindow = exactWindowElement(windowID: window.id, processIdentifier: app.processIdentifier)
+            let matchedWindow = exactWindow
                 ?? matchingWindowElement(for: window, processIdentifier: app.processIdentifier)
+            focusLogger.info("focusWindow: exact AX match: \(exactWindow != nil), any AX match: \(matchedWindow != nil)")
 
             guard let matchedWindow else {
-                // Accessibility doesn't list windows an app has closed but kept alive
-                // (Notes and Activity Monitor do this). Reopen the app like a Dock click,
-                // which makes it show its main window again.
-                self.reopenApp(app)
+                if isOnAnotherSpace {
+                    // Activating or reopening the app would bring forward whichever of
+                    // its windows is already visible (e.g. one on another display).
+                    // Bring forward this exact window instead; macOS then switches to
+                    // its Space.
+                    self.focusWindowByID(window.id, processIdentifier: app.processIdentifier)
+                } else {
+                    // Accessibility doesn't list windows an app has closed but kept alive
+                    // (Notes and Activity Monitor do this). Reopen the app like a Dock
+                    // click, which makes it show its main window again.
+                    self.reopenApp(app)
+                }
                 return
             }
 
@@ -279,19 +319,26 @@ final class WindowInventory {
             _ = AXUIElementSetAttributeValue(element, kAXMinimizedAttribute as CFString, NSNumber(value: false))
         }
 
-        var processSerialNumber = ProcessSerialNumber(highLongOfPSN: 0, lowLongOfPSN: UInt32(kNoProcess))
-        let lookupStatus = LegacyGetProcessForPID(processIdentifier, &processSerialNumber)
-
-        if lookupStatus == noErr {
-            _ = PrivateWindowFocusSPI.setFrontProcessWithOptions?(&processSerialNumber, UInt32(windowID), cpsUserGenerated)
-            makeKeyWindow(&processSerialNumber, windowID: windowID)
-        }
+        focusWindowByID(windowID, processIdentifier: processIdentifier)
 
         let applicationElement = AXUIElementCreateApplication(processIdentifier)
         _ = AXUIElementSetAttributeValue(applicationElement, kAXFocusedWindowAttribute as CFString, element)
         _ = AXUIElementSetAttributeValue(element, kAXMainAttribute as CFString, NSNumber(value: true))
         _ = AXUIElementSetAttributeValue(element, kAXFocusedAttribute as CFString, NSNumber(value: true))
         AXUIElementPerformAction(element, kAXRaiseAction as CFString)
+    }
+
+    /// Asks the window server to bring a specific window to the front and make it key,
+    /// without going through Accessibility. Works for windows on other Spaces, which
+    /// macOS then switches to.
+    private func focusWindowByID(_ windowID: CGWindowID, processIdentifier: pid_t) {
+        var processSerialNumber = ProcessSerialNumber(highLongOfPSN: 0, lowLongOfPSN: UInt32(kNoProcess))
+        guard LegacyGetProcessForPID(processIdentifier, &processSerialNumber) == noErr else {
+            return
+        }
+
+        _ = PrivateWindowFocusSPI.setFrontProcessWithOptions?(&processSerialNumber, UInt32(windowID), cpsUserGenerated)
+        makeKeyWindow(&processSerialNumber, windowID: windowID)
     }
 
     private func installWorkspaceObservers() {
@@ -874,8 +921,12 @@ final class WindowInventory {
     private func focusMatchScore(for window: SidebarWindow, element: AXUIElement) -> Int {
         var score = 0
 
-        if let axWindowNumber = axIntValue(for: "AXWindowNumber", on: element),
-           CGWindowID(axWindowNumber) == window.id {
+        if let axWindowNumber = axIntValue(for: "AXWindowNumber", on: element) {
+            // A known, different window number means a different window, however
+            // similar its title or size (e.g. the same app's window on another display).
+            guard CGWindowID(axWindowNumber) == window.id else {
+                return 0
+            }
             score += 10
         }
 
@@ -1343,6 +1394,70 @@ private struct WindowTitleSignature: Hashable {
     }
 }
 
+/// Logs window-focus and Space-switch decisions. View them with:
+/// `log show --last 5m --info --predicate 'subsystem == "lapp.WindowBar"'`
+private let focusLogger = Logger(subsystem: "lapp.WindowBar", category: "focus")
+
+/// A Mission Control keyboard shortcut as configured in System Settings > Keyboard >
+/// Keyboard Shortcuts > Mission Control, read from the system's symbolic hot keys.
+private struct MissionControlShortcut {
+    private static let moveLeftHotKeyID = "79"
+    private static let moveRightHotKeyID = "81"
+    private static let leftArrowKeyCode: CGKeyCode = 123
+    private static let rightArrowKeyCode: CGKeyCode = 124
+    /// macOS's default modifiers for these shortcuts: Control plus Function (arrow keys).
+    private static let defaultModifiers: CGEventFlags = [.maskControl, .maskSecondaryFn]
+
+    let keyCode: CGKeyCode
+    let modifiers: CGEventFlags
+
+    /// The "Move left/right a space" shortcut, or nil if the user turned it off.
+    static func moveOneSpace(right: Bool) -> MissionControlShortcut? {
+        let hotKeyID = right ? moveRightHotKeyID : moveLeftHotKeyID
+        let defaultShortcut = MissionControlShortcut(
+            keyCode: right ? rightArrowKeyCode : leftArrowKeyCode,
+            modifiers: defaultModifiers
+        )
+
+        guard
+            let hotKeys = UserDefaults(suiteName: "com.apple.symbolichotkeys")?.dictionary(forKey: "AppleSymbolicHotKeys"),
+            let entry = hotKeys[hotKeyID] as? [String: Any]
+        else {
+            // Never customized: macOS uses its default, which is enabled.
+            return defaultShortcut
+        }
+
+        if let enabled = entry["enabled"] as? Bool, !enabled {
+            return nil
+        }
+
+        // Parameters are (character, key code, modifier flags); the flags use the
+        // same bit values as CGEventFlags.
+        guard
+            let value = entry["value"] as? [String: Any],
+            let parameters = value["parameters"] as? [Int],
+            parameters.count == 3
+        else {
+            return defaultShortcut
+        }
+
+        return MissionControlShortcut(
+            keyCode: CGKeyCode(parameters[1]),
+            modifiers: CGEventFlags(rawValue: UInt64(parameters[2]))
+        )
+    }
+
+    func press() {
+        let source = CGEventSource(stateID: .hidSystemState)
+        let keyDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true)
+        let keyUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
+        keyDown?.flags = modifiers
+        keyUp?.flags = modifiers
+        keyDown?.post(tap: .cghidEventTap)
+        keyUp?.post(tap: .cghidEventTap)
+    }
+}
+
 private typealias CGSConnectionID = Int32
 private let cgsSpaceQuerySelector: Int32 = 0x7
 private let cpsUserGenerated: UInt32 = 0x200
@@ -1473,6 +1588,7 @@ private struct SpaceResolver {
             let currentIndex = missionControlIndexBySpaceID[activeSpaceID],
             let targetIndex = missionControlIndexBySpaceID[spaceID]
         else {
+            focusLogger.error("switchToSpace: no Mission Control index for active \(activeSpaceID) or target \(spaceID)")
             return false
         }
 
@@ -1481,15 +1597,39 @@ private struct SpaceResolver {
             return true
         }
 
-        let swipeDirection = targetIndex > currentIndex ? 1.0 : -1.0
-        guard let dockSwipeEvent = CGEvent(source: nil) else {
-            return false
-        }
+        let movesRight = targetIndex > currentIndex
+        let swipeDirection = movesRight ? 1.0 : -1.0
 
         let originalCursorPosition = CGEvent(source: nil)?.location
+        let targetFrame = targetDisplayFrame(for: spaceID)
+        focusLogger.info("switchToSpace: active \(activeSpaceID) (index \(currentIndex)) -> target \(spaceID) (index \(targetIndex)), \(swipeCount) step(s), target display frame \(String(describing: targetFrame), privacy: .public)")
 
-        if let targetFrame = targetDisplayFrame(for: spaceID) {
-            CGWarpMouseCursorPosition(CGPoint(x: targetFrame.midX, y: targetFrame.midY))
+        // Space switching acts on the display under the pointer, so move it there first.
+        // NSScreen frames use a bottom-left origin, but warping uses Core Graphics
+        // coordinates with a top-left origin on the primary display, so flip y.
+        if let targetFrame, let primaryHeight = NSScreen.screens.first?.frame.height {
+            CGWarpMouseCursorPosition(CGPoint(x: targetFrame.midX, y: primaryHeight - targetFrame.midY))
+        }
+
+        defer {
+            if let originalCursorPosition {
+                CGWarpMouseCursorPosition(originalCursorPosition)
+            }
+        }
+
+        // Preferred: press the "Move left/right a space" shortcut from Mission Control
+        // settings. Synthetic trackpad swipes are ignored on some systems.
+        if let shortcut = MissionControlShortcut.moveOneSpace(right: movesRight) {
+            focusLogger.info("switchToSpace: pressing Move \(movesRight ? "right" : "left", privacy: .public) a space shortcut \(swipeCount) time(s)")
+            for _ in 0..<swipeCount {
+                shortcut.press()
+            }
+            return true
+        }
+
+        focusLogger.info("switchToSpace: Move a space shortcut is disabled, falling back to a Dock swipe")
+        guard let dockSwipeEvent = CGEvent(source: nil) else {
+            return false
         }
 
         dockSwipeEvent.setIntegerValueField(cgsEventTypeField, value: 30)
@@ -1505,17 +1645,10 @@ private struct SpaceResolver {
             dockSwipeEvent.post(tap: .cgSessionEventTap)
         }
 
-        if currentSpaceID(for: spaceID) != spaceID, let targetFrame = targetDisplayFrame(for: spaceID) {
-            let clickPoint = CGPoint(x: targetFrame.midX, y: targetFrame.midY)
-            let mouseDown = CGEvent(mouseEventSource: nil, mouseType: .leftMouseDown, mouseCursorPosition: clickPoint, mouseButton: .left)
-            let mouseUp = CGEvent(mouseEventSource: nil, mouseType: .leftMouseUp, mouseCursorPosition: clickPoint, mouseButton: .left)
-            mouseDown?.post(tap: .cgSessionEventTap)
-            mouseUp?.post(tap: .cgSessionEventTap)
-        }
-
-        if let originalCursorPosition {
-            CGWarpMouseCursorPosition(originalCursorPosition)
-        }
+        // No synthetic click here: the swipe animates asynchronously, so the Space
+        // hasn't changed yet at this point, and a click would land on whatever window
+        // is under the display's center and could interrupt the switch. The caller
+        // waits for the switch and retries the swipe if it didn't happen.
 
         return true
     }
